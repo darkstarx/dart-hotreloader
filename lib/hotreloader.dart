@@ -153,29 +153,72 @@ For hot code reloading to function properly, Dart needs to be run from the root 
     }
 
     var watchList = ['bin', 'lib', 'test'];
+    var context = p.context;
+
+    final packagesFilePath = (await pub.packagesFile).path;
+    final packagesDirPath = p.dirname(packagesFilePath);
+    final projectPath = p.dirname(packagesDirPath);
+    if (p.isAbsolute(projectPath) && context.current != projectPath) {
+      // The package is a part of the pub workspace. Change the context to the
+      // workspace root and correct relative paths in the watchList.
+      context = p.Context(current: projectPath);
+      watchList = watchList
+        .map(p.absolute)
+        .map(context.relative)
+        .toList();
+    }
 
     if (_watchDependencies) {
+      final pubCachePath = pub.pubCacheDir.path;
+      log.fine('pubCachePath: [$pubCachePath]');
+
+      bool isNotPubCached(final String path)
+      {
+        if (path == pubCachePath || p.isWithin(pubCachePath, path)) {
+          log.fine('Skipped watching cached package at [$path]');
+          return false;
+        }
+        return true;
+      }
+
       // add .packages file to watch list
-      watchList.add((await pub.packagesFile).path);
+      watchList.add(packagesFilePath);
       // add source folders of all dependencies to watch list
       final pkgConfigURL = await isolates.Isolate.packageConfig;
       if (pkgConfigURL != null) {
         log.config('pkgConfigURL: $pkgConfigURL');
         if (pkgConfigURL.path.endsWith('.json')) {
-          convert.json
-              .decode(await new io.File(pkgConfigURL.toFilePath()).readAsString())['packages']
-              .map((dynamic v) => v['rootUri'].toString())
+          final config = convert.json
+            .decode(await new io.File(pkgConfigURL.toFilePath()).readAsString());
+          final packages = config is Map<String, dynamic>
+            ? config['packages']
+            : null;
+          if (packages is List) {
+            packages
+              .whereType<Map<String, dynamic>>()
+              .map((v) => v['rootUri'].toString())
+              .where(isNotPubCached)
 
               // '../' means relative to <project>/.dart_tool
               // since we are already at <project> level we change '../' to './'
-              .map((dynamic rootUri) => rootUri.toString().startsWith('../') ? rootUri.substring(1) : rootUri)
-              .map((dynamic rootUri) => Uri.parse(rootUri.toString()).toFilePath())
+              .map((rootUri) => rootUri.startsWith('../')
+                ? rootUri.substring(1)
+                : rootUri
+              )
+
+              .map((rootUri) => Uri.parse(rootUri).toFilePath())
               .forEach(watchList.add);
+          } else {
+            log.config(
+              'Failed to watch dependencies: bad package config format.'
+            );
+          }
         } else {
           await pkgConfigURL
               .readLineByLine()
               .where((l) => !l.startsWith('#') && l.contains(':'))
               .map((l) => Uri.parse(strings.substringAfter(l, ':')).toFilePath())
+              .where(isNotPubCached)
               .forEach(watchList.add);
         }
       }
@@ -186,21 +229,17 @@ For hot code reloading to function properly, Dart needs to be run from the root 
       watchList = watchList.where((e) => !excludedPaths.contains(e)).toList();
     }
 
-    watchList = watchList.map(p.absolute).map(p.normalize).toSet().toList();
+    watchList = watchList
+      .map(context.absolute)
+      .map(context.normalize)
+      .toSet().toList();
     watchList.sort();
-
-    final pubCacheDir = pub.pubCacheDir;
-    log.fine('pubCacheDir: [${pubCacheDir.path}]');
 
     final isDockerized = await docker.isRunningInDockerContainer;
     log.fine('isDockerized: [$isDockerized]');
 
     final watchers = <Watcher>[];
     for (final path in watchList) {
-      if (path == pubCacheDir.path || p.isWithin(pubCacheDir.path, path)) {
-        log.fine('Skipped watching cached package at [$path]');
-        continue;
-      }
       if (watchers.where((w) => path == w.path || p.isWithin(w.path, path)).isNotEmpty) {
         log.fine('Skipped watching [$path] since parent path is already being watched');
         continue;
@@ -342,7 +381,7 @@ For hot code reloading to function properly, Dart needs to be run from the root 
    *
    * @param force: indicates that code from all source files should be reloaded regardless of their modification time.
    */
-  Future<HotReloadResult> reloadCode({final bool force = false}) async {
+  Future<HotReloadResult> reloadCode({final bool force = false}) {
     return _reloadCode(null, force);
   }
 
